@@ -4,18 +4,19 @@ import React, { useState, useRef } from "react";
 import Modal from "./Modal";
 import { api, type ApiUser } from "./api";
 
-export default function CreateGroupModal({
+export default function AddGroupMembersModal({
   open,
   onClose,
-  myUser,
-  onGroupCreated,
+  chatId,
+  myUserId,
+  onMembersAdded,
 }: {
   open: boolean;
   onClose: () => void;
-  myUser: ApiUser | null;
-  onGroupCreated?: (chat: { id: string; chatId: number; name: string; avatar: string; type: 'group' }) => void;
+  chatId: number;
+  myUserId?: number;
+  onMembersAdded?: () => void;
 }) {
-  const [groupName, setGroupName] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<ApiUser[]>([]);
   const [selectedUsers, setSelectedUsers] = useState<ApiUser[]>([]);
@@ -33,7 +34,7 @@ export default function CreateGroupModal({
       try {
         const results = await api.searchUsers(q.trim());
         setSearchResults(
-          results.filter(u => u.id !== myUser?.id && !selectedUsers.some(s => s.id === u.id))
+          results.filter(u => u.id !== myUserId && !selectedUsers.some(s => s.id === u.id))
         );
       } catch {
         setSearchResults([]);
@@ -53,34 +54,23 @@ export default function CreateGroupModal({
     setSelectedUsers(prev => prev.filter(u => u.id !== userId));
   }
 
-  async function handleCreate(e: React.FormEvent) {
+  async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
-    if (!myUser || !groupName.trim()) return;
+    if (!selectedUsers.length) return;
     setLoading(true);
     setError("");
     try {
-      const chat = await api.createGroupChat({
-        name: groupName.trim(),
-        created_by: myUser.id,
-        members: selectedUsers.map(u => u.id),
-      });
-      onGroupCreated?.({
-        id: String(chat.id),
-        chatId: chat.id,
-        name: chat.name ?? groupName.trim(),
-        avatar: `https://api.dicebear.com/7.x/thumbs/svg?seed=group${chat.id}`,
-        type: 'group',
-      });
+      await api.addGroupMembers(chatId, selectedUsers.map(u => u.id));
+      onMembersAdded?.();
       handleClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to create group");
+      setError(err instanceof Error ? err.message : "Failed to add members");
     } finally {
       setLoading(false);
     }
   }
 
   function handleClose() {
-    setGroupName("");
     setSelectedUsers([]);
     setSearchQuery("");
     setSearchResults([]);
@@ -89,22 +79,9 @@ export default function CreateGroupModal({
   }
 
   return (
-    <Modal open={open} onClose={handleClose} title="Create New Group">
-      <form onSubmit={handleCreate} className="space-y-4">
+    <Modal open={open} onClose={handleClose} title="Add Members">
+      <form onSubmit={handleAdd} className="space-y-4">
         <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">Group Name</label>
-          <input
-            type="text"
-            value={groupName}
-            onChange={e => setGroupName(e.target.value)}
-            placeholder="Enter group name..."
-            className="w-full bg-[#1e1e2a] border border-[#303048] rounded-lg py-2 px-4 text-white placeholder-gray-500"
-            required
-          />
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-300 mb-2">Add Members</label>
           {selectedUsers.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-2">
               {selectedUsers.map(u => (
@@ -121,10 +98,11 @@ export default function CreateGroupModal({
             onChange={e => handleSearch(e.target.value)}
             placeholder="Search users by username..."
             className="w-full bg-[#1e1e2a] border border-[#303048] rounded-lg py-2 px-4 text-white placeholder-gray-500"
+            autoFocus
           />
           {searchLoading && <p className="text-gray-500 text-xs mt-1">Searching…</p>}
           {searchResults.length > 0 && (
-            <ul className="mt-1 max-h-36 overflow-y-auto rounded-lg border border-[#303048] divide-y divide-[#303048]">
+            <ul className="mt-1 max-h-40 overflow-y-auto rounded-lg border border-[#303048] divide-y divide-[#303048]">
               {searchResults.map(u => (
                 <li
                   key={u.id}
@@ -144,6 +122,9 @@ export default function CreateGroupModal({
               ))}
             </ul>
           )}
+          {searchQuery && !searchLoading && searchResults.length === 0 && (
+            <p className="text-gray-600 text-xs mt-1">No users found.</p>
+          )}
         </div>
 
         {error && <p className="text-red-400 text-sm">{error}</p>}
@@ -159,9 +140,9 @@ export default function CreateGroupModal({
           <button
             type="submit"
             className="bg-purple-700 hover:bg-purple-600 text-white rounded-lg px-4 py-2 transition font-medium disabled:opacity-50"
-            disabled={!groupName.trim() || loading}
+            disabled={!selectedUsers.length || loading}
           >
-            {loading ? "Creating…" : "Create Group"}
+            {loading ? "Adding…" : "Add Members"}
           </button>
         </div>
       </form>

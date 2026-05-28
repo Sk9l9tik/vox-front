@@ -8,8 +8,10 @@ import Modal from "./Modal";
 import MyProfileModal from "./MyProfileModal";
 import UserProfileModal from "./UserProfileModal";
 import CreateGroupModal from "./CreateGroupModal";
+import AddGroupMembersModal from "./AddGroupMembersModal";
+import GroupProfileModal from "./GroupProfileModal";
 import SettingsModal from "./SettingsModal";
-import { api, type ApiUser } from "./api";
+import { api, type ApiUser, type ApiChat, type ApiChatEntry, type ApiMessage } from "./api";
 
 type Attachment = {
   name: string;
@@ -22,12 +24,14 @@ type Attachment = {
 type Message = {
   id: number;
   date?: string;
+  dateKey?: string;
   author: string;
   authorSubtitle?: string;
   content: string;
   time: string;
   systemMessage?: boolean;
   attachments?: Attachment[];
+  status?: 'pending' | 'sent' | 'read';
 };
 
 type AttachmentPreview = {
@@ -37,6 +41,7 @@ type AttachmentPreview = {
   isImage: boolean;
   previewUrl: string;
   ext: string;
+  file: File;
 };
 
 const EXT_COLORS: Record<string, string> = {
@@ -56,6 +61,21 @@ function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function todayDateKey() {
+  return new Date().toLocaleDateString('en-CA');
+}
+
+function formatDateMarker(dateKey: string): string {
+  const todayKey = todayDateKey();
+  const yd = new Date();
+  yd.setDate(yd.getDate() - 1);
+  const yesterdayKey = yd.toLocaleDateString('en-CA');
+  if (dateKey === todayKey) return 'Today';
+  if (dateKey === yesterdayKey) return 'Yesterday';
+  const d = new Date(dateKey + 'T12:00:00');
+  return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
 }
 
 function avatarUrl(seed: string) {
@@ -81,6 +101,8 @@ const App = () => {
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [newGroupOpen, setNewGroupOpen] = useState(false);
+  const [addMembersOpen, setAddMembersOpen] = useState(false);
+  const [groupProfileOpen, setGroupProfileOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newChatValue, setNewChatValue] = useState("");
   const [myUser, setMyUser] = useState<ApiUser | null>(null);
@@ -88,15 +110,42 @@ const App = () => {
   const [contactProfileOpen, setContactProfileOpen] = useState(false);
   const [searchResults, setSearchResults] = useState<ApiUser[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
-  const [dynamicChats, setDynamicChats] = useState<{ id: string; name: string; avatar: string }[]>([]);
+  const [dynamicChats, setDynamicChats] = useState<{ id: string; chatId?: number; name: string; avatar: string; pendingRecipientId?: number; chatType?: 'private' | 'group' }[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
+  const userNameCache = useRef<Map<number, string>>(new Map());
   const [enterToSend, setEnterToSend] = useState(true);
   const [fontSize, setFontSize] = useState<'small' | 'medium' | 'large'>('medium');
   const [messageInput, setMessageInput] = useState("");
   const [chatMessages, setChatMessages] = useState<Record<string, Message[]>>({});
+  const [historicalMessages, setHistoricalMessages] = useState<Record<string, Message[]>>({});
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentPreview[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [connStatus, setConnStatus] = useState<'connected' | 'reconnecting' | 'offline'>('connected');
+  const wsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wsReconnectDelay = useRef(1000);
+  const wsUnmounted = useRef(false);
+  const wsConnectRef = useRef<(() => void) | null>(null);
+  type QueuedMsg = { chatKey: string; chatIdNum: number; text: string; tempId: number };
+  const pendingQueueRef = useRef<QueuedMsg[]>([]);
+  const readCursorsRef = useRef<Record<string, number>>({});
+  // Always holds the latest activeChat value so WS closures can read it without stale captures
+  const activeChatRef = useRef(activeChat);
+
+  const resolveAuthor = async (senderId: number, myId: number): Promise<string> => {
+    if (senderId === myId) return 'You';
+    const cached = userNameCache.current.get(senderId);
+    if (cached) return cached;
+    try {
+      const u = await api.getUser(senderId);
+      const name = u.display_name || u.username;
+      userNameCache.current.set(senderId, name);
+      return name;
+    } catch {
+      return String(senderId);
+    }
+  };
 
   useEffect(() => {
     setMounted(true);
@@ -105,12 +154,321 @@ const App = () => {
     setAuthed(!!token);
     if (token) setAuthToken(token);
     if (userStr) {
-      try { setMyUser(JSON.parse(userStr)); } catch {}
+      try {
+        const cached = JSON.parse(userStr);
+        setMyUser(cached);
+        // Re-fetch from server to get latest display_name/bio
+        api.getUser(cached.id).then(fresh => {
+          setMyUser(fresh);
+          localStorage.setItem("authUser", JSON.stringify(fresh));
+        }).catch(() => {});
+      } catch {}
     }
+  }, []);
+
+  // Load existing chats from backend on startup
+  useEffect(() => {
+    if (!myUser) return;
+    (async () => {
+      try {
+        const entries: ApiChatEntry[] = await api.getMyChats(myUser.id);
+        const resolved = await Promise.all(
+          entries.map(async (chat) => {
+            if (chat.type === 'private') {
+              const otherId = chat.members?.find(id => id !== myUser.id);
+              if (otherId) {
+                try {
+                  const other = await api.getUser(otherId);
+                  userNameCache.current.set(other.id, other.display_name || other.username);
+                  return {
+                    id: String(chat.id),
+                    chatId: chat.id,
+                    chatType: 'private' as const,
+                    name: other.display_name || other.username,
+                    avatar: other.avatar_url ??
+                      `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(other.username)}`,
+                  };
+                } catch {}
+              }
+              return { id: String(chat.id), chatId: chat.id, chatType: 'private' as const, name: `Chat ${chat.id}`, avatar: '' };
+            }
+            return {
+              id: String(chat.id),
+              chatId: chat.id,
+              chatType: 'group' as const,
+              name: chat.name ?? `Group ${chat.id}`,
+              avatar: `https://api.dicebear.com/7.x/thumbs/svg?seed=group${chat.id}`,
+            };
+          })
+        );
+        setDynamicChats(resolved);
+
+        // Pre-fetch messages for all chats so the sidebar shows last messages immediately
+        resolved.forEach(chat => {
+          const chatIdNum = parseInt(chat.id);
+          if (isNaN(chatIdNum)) return;
+          api.getChatMessages(chatIdNum).then(async ({ messages: rawMsgs }) => {
+            if (!rawMsgs.length) return;
+            const apiMsgs = [...rawMsgs].reverse();
+            const mapped = await Promise.all(apiMsgs.map(async (m: ApiMessage) => ({
+              id: m.id,
+              author: await resolveAuthor(m.sender_id, myUser.id),
+              content: m.text,
+              time: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              dateKey: new Date(m.created_at).toLocaleDateString('en-CA'),
+              attachments: m.attachment_url ? [{ name: 'attachment', size: '', isImage: true, url: m.attachment_url, ext: '' }] : undefined,
+            })));
+            setHistoricalMessages(prev => ({ ...prev, [chat.id]: mapped }));
+          }).catch(() => {});
+        });
+      } catch {}
+    })();
+  }, [myUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // WebSocket connection with auto-reconnect
+  useEffect(() => {
+    if (!authToken || !myUser) return;
+    wsUnmounted.current = false;
+    const token = authToken;
+    const userId = myUser.id;
+
+    function connect() {
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) return;
+      if (wsReconnectTimer.current) { clearTimeout(wsReconnectTimer.current); wsReconnectTimer.current = null; }
+
+      const ws = new WebSocket(`ws://${window.location.hostname}:8080/ws`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'auth', token }));
+        setConnStatus('connected');
+        wsReconnectDelay.current = 1000;
+        // Re-fetch active chat cursor to pick up read receipts missed during disconnect
+        const chatIdNum = parseInt(activeChatRef.current);
+        if (!isNaN(chatIdNum)) {
+          api.getChatMessages(chatIdNum, 50, userId).then(({ others_cursor }) => {
+            if (others_cursor != null) {
+              const chatKey = String(chatIdNum);
+              readCursorsRef.current[chatKey] = Math.max(readCursorsRef.current[chatKey] ?? 0, others_cursor);
+              const markRead = (msgs: Message[]) => msgs.map(m =>
+                m.author === 'You' && m.id > 0 && m.id <= others_cursor! ? { ...m, status: 'read' as const } : m
+              );
+              setChatMessages(prev => ({ ...prev, [chatKey]: markRead(prev[chatKey] ?? []) }));
+              setHistoricalMessages(prev => ({ ...prev, [chatKey]: markRead(prev[chatKey] ?? []) }));
+            }
+          }).catch(() => {});
+        }
+        // Flush queued messages
+        const queue = pendingQueueRef.current.splice(0);
+        queue.forEach(item => {
+          const fd = new FormData();
+          fd.append('chat_id', String(item.chatIdNum));
+          fd.append('sender_id', String(userId));
+          fd.append('text', item.text);
+          fetch('/api/messages/send', { method: 'POST', body: fd })
+            .then(async r => {
+              if (r.ok) {
+                const json = await r.json();
+                setChatMessages(prev => {
+                  const msgs = prev[item.chatKey];
+                  if (!msgs) return prev;
+                  const cursor = readCursorsRef.current[item.chatKey] ?? 0;
+                  const status = json.id <= cursor ? 'read' : 'sent';
+                  return { ...prev, [item.chatKey]: msgs.map(m => m.id === item.tempId ? { ...m, id: json.id, status } : m) };
+                });
+              }
+            })
+            .catch(() => pendingQueueRef.current.push(item));
+        });
+      };
+
+      ws.onmessage = async (e) => {
+        try {
+          const raw = e.data instanceof Blob ? await (e.data as Blob).text() : e.data as string;
+          const data = JSON.parse(raw);
+          if (data.type === 'auth_ok' || data.type === 'error') return;
+
+          // Read receipt — update my sent messages to 'read'
+          if (data.type === 'read-message' && data.payload) {
+            const { last_read, readed_by, chat_id } = data.payload;
+            if (readed_by !== userId && chat_id != null) {
+              const chatKey = String(chat_id);
+              // Remember cursor so pending→sent transitions can pick it up retroactively
+              readCursorsRef.current[chatKey] = Math.max(readCursorsRef.current[chatKey] ?? 0, last_read);
+              const markRead = (msgs: Message[]) => msgs.map(m =>
+                m.author === 'You' && m.id > 0 && m.id <= last_read ? { ...m, status: 'read' as const } : m
+              );
+              setChatMessages(prev => ({ ...prev, [chatKey]: markRead(prev[chatKey] ?? []) }));
+              setHistoricalMessages(prev => ({ ...prev, [chatKey]: markRead(prev[chatKey] ?? []) }));
+            }
+            return;
+          }
+
+          // Group membership notification — add the group to sidebar for new members
+          if (data.type === 'group_added' && data.chat) {
+            const chatKey = String(data.chat.id);
+            setDynamicChats(prev => {
+              if (prev.some(c => c.id === chatKey)) return prev;
+              return [{
+                id: chatKey,
+                chatId: data.chat.id,
+                chatType: 'group' as const,
+                name: data.chat.name ?? `Group ${data.chat.id}`,
+                avatar: `https://api.dicebear.com/7.x/thumbs/svg?seed=group${data.chat.id}`,
+              }, ...prev];
+            });
+            return;
+          }
+
+          if (data.type !== 'new-message' || !data.payload) return;
+
+          const msg = data.payload;
+          if (msg.chat_id == null || msg.sender_id == null) return;
+
+          // Skip own messages — shown optimistically on send
+          if (msg.sender_id === userId) return;
+
+          const chatKey = String(msg.chat_id);
+          resolveAuthor(msg.sender_id, userId).then(author => {
+            const newMsg: Message = {
+              id: msg.id ?? Date.now(),
+              author,
+              content: msg.text ?? '',
+              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              dateKey: todayDateKey(),
+              attachments: msg.attachment_url ? [{
+                name: msg.attachment_name || 'attachment',
+                size: msg.attachment_size ? formatSize(msg.attachment_size) : '',
+                isImage: (msg.attachment_type as string | undefined)?.startsWith('image/') ?? true,
+                url: `/api/files/${msg.attachment_url}`,
+                ext: (msg.attachment_name as string | undefined)?.split('.').pop() || '',
+              }] : undefined,
+            };
+            setChatMessages(prev => ({
+              ...prev,
+              [chatKey]: [...(prev[chatKey] ?? []), newMsg],
+            }));
+            // If the user is actively viewing this chat, send a read receipt immediately
+            if (chatKey === activeChatRef.current && newMsg.id) {
+              fetch('/api/messages/read', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message_id: newMsg.id, user_id: userId }),
+              }).catch(() => {});
+            }
+          });
+          // Add unknown chat to sidebar — fetch real chat info to determine type
+          setDynamicChats(prev => {
+            if (prev.some(c => c.id === chatKey)) return prev;
+            (async () => {
+              try {
+                const chatInfo = await api.getChat(msg.chat_id);
+                if (chatInfo.type === 'group') {
+                  const name = chatInfo.name ?? `Group ${msg.chat_id}`;
+                  const avatar = `https://api.dicebear.com/7.x/thumbs/svg?seed=group${msg.chat_id}`;
+                  setDynamicChats(p => p.some(c => c.id === chatKey) ? p : [{ id: chatKey, chatId: msg.chat_id, chatType: 'group' as const, name, avatar }, ...p]);
+                } else {
+                  const other = await api.getUser(msg.sender_id);
+                  const name = other.display_name || other.username;
+                  const avatar = other.avatar_url ?? `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(other.username)}`;
+                  setDynamicChats(p => p.some(c => c.id === chatKey) ? p : [{ id: chatKey, chatId: msg.chat_id, chatType: 'private' as const, name, avatar }, ...p]);
+                }
+              } catch {}
+            })();
+            return prev;
+          });
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        wsRef.current = null;
+        if (!wsUnmounted.current) {
+          setConnStatus(navigator.onLine ? 'reconnecting' : 'offline');
+          wsReconnectTimer.current = setTimeout(() => {
+            wsReconnectDelay.current = Math.min(wsReconnectDelay.current * 2, 30000);
+            connect();
+          }, navigator.onLine ? wsReconnectDelay.current : 5000);
+        }
+      };
+
+      ws.onerror = () => {};
+    }
+
+    wsConnectRef.current = connect;
+    connect();
+
+    return () => {
+      wsUnmounted.current = true;
+      if (wsReconnectTimer.current) clearTimeout(wsReconnectTimer.current);
+      wsConnectRef.current = null;
+      wsRef.current?.close();
+      wsRef.current = null;
+    };
+  }, [authToken, myUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Online / offline reconnect trigger
+  useEffect(() => {
+    const goOnline = () => {
+      if (wsConnectRef.current) {
+        setConnStatus('reconnecting');
+        wsConnectRef.current();
+      }
+    };
+    const goOffline = () => setConnStatus('offline');
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+    };
   }, []);
 
   const myNickname = myUser?.display_name || myUser?.username || "User";
   const myBio = myUser?.bio ?? "";
+
+  useEffect(() => {
+    const chatIdNum = parseInt(activeChat);
+    if (isNaN(chatIdNum) || !myUser) return;
+    (async () => {
+      try {
+        const { messages: rawMsgs, others_cursor } = await api.getChatMessages(chatIdNum, 50, myUser.id);
+        const apiMsgs = [...rawMsgs].reverse();
+        const mapped: Message[] = await Promise.all(apiMsgs.map(async (m: ApiMessage) => ({
+          id: m.id,
+          author: await resolveAuthor(m.sender_id, myUser.id),
+          content: m.text,
+          time: new Date(m.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          dateKey: new Date(m.created_at).toLocaleDateString('en-CA'),
+          status: m.sender_id === myUser.id
+            ? (others_cursor != null && m.id <= others_cursor ? 'read' : 'sent') as Message['status']
+            : undefined,
+          attachments: m.attachment_url ? [{
+            name: m.attachment_name || 'attachment',
+            size: m.attachment_size ? formatSize(m.attachment_size) : '',
+            isImage: m.attachment_type?.startsWith('image/') ?? true,
+            url: `/api/files/${m.attachment_url}`,
+            ext: m.attachment_name?.split('.').pop() || '',
+          }] : undefined,
+        })));
+        // Seed cursor so pending→sent transitions that race with WS see it immediately
+        if (others_cursor != null) {
+          readCursorsRef.current[activeChat] = Math.max(readCursorsRef.current[activeChat] ?? 0, others_cursor);
+        }
+        setHistoricalMessages(prev => ({ ...prev, [activeChat]: mapped }));
+        // Mark all visible messages as read
+        if (apiMsgs.length > 0) {
+          fetch('/api/messages/read', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message_id: apiMsgs[apiMsgs.length - 1].id, user_id: myUser.id }),
+          }).catch(() => {});
+        }
+      } catch {}
+    })();
+  }, [activeChat, myUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep the ref in sync so the WS closure always sees the current active chat
+  useEffect(() => { activeChatRef.current = activeChat; }, [activeChat]);
 
   useEffect(() => {
     const handleProfileToggle = () => { setProfileOpen(true); setSidebarOpen(false); };
@@ -133,7 +491,7 @@ const App = () => {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, activeChat]);
+  }, [chatMessages, historicalMessages, activeChat]);
 
   if (!mounted) return null;
   if (!authed) return <StarterPage />;
@@ -243,9 +601,9 @@ Tine-Line — симулятор жизни в открытом мире на р
   };
 
   function getLastMsgMeta(id: string) {
-    const msgs = messages[id];
-    if (!msgs?.length) return { lastMessage: '', lastSender: undefined, time: undefined };
-    const last = msgs[msgs.length - 1];
+    const all = [...(messages[id] ?? []), ...(historicalMessages[id] ?? []), ...(chatMessages[id] ?? [])];
+    if (!all.length) return { lastMessage: '', lastSender: undefined, time: undefined };
+    const last = all[all.length - 1];
     return {
       lastMessage: last.content?.replace(/\*\*/g, '') || last.attachments?.[0]?.name || '',
       lastSender: last.author,
@@ -264,24 +622,145 @@ Tine-Line — симулятор жизни в открытом мире на р
     ...staticChats,
     ...dynamicChats
       .filter(c => !staticChatIds.has(c.id))
-      .map(c => ({ ...c, type: 'dm', unread: 0, ...getLastMsgMeta(c.id) })),
+      .map(c => ({ ...c, type: c.chatType === 'group' ? 'group' : 'dm', unread: 0, ...getLastMsgMeta(c.id) })),
   ];
 
-  const currentMessages = [...(messages[activeChat] || []), ...(chatMessages[activeChat] || [])];
+  const seenMsgIds = new Set<number>();
+  const currentMessages = [
+    ...(messages[activeChat] || []),
+    ...(historicalMessages[activeChat] || []),
+    ...(chatMessages[activeChat] || []),
+  ].filter(m => { if (seenMsgIds.has(m.id)) return false; seenMsgIds.add(m.id); return true; });
   const currentChat = chats.find(c => c.id === activeChat);
   const isGroupChat = currentChat?.type === 'group';
 
-  function sendMessage() {
+  async function sendMessage() {
     const text = messageInput.trim();
-    if (!text || !activeChat) return;
-    const newMsg: Message = {
-      id: Date.now(),
-      author: 'You',
-      content: text,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    };
-    setChatMessages(prev => ({ ...prev, [activeChat]: [...(prev[activeChat] || []), newMsg] }));
-    setMessageInput("");
+    if (!text && pendingAttachments.length === 0) return;
+    if (!activeChat || !myUser) return;
+
+    const attachments = [...pendingAttachments];
+    setMessageInput('');
+    setPendingAttachments([]);
+
+    const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    const pendingChat = dynamicChats.find(c => c.id === activeChat && c.pendingRecipientId != null);
+
+    if (pendingChat) {
+      const firstAtt = attachments[0];
+      const fd = new FormData();
+      fd.append('sender_id', String(myUser.id));
+      fd.append('recipient_id', String(pendingChat.pendingRecipientId!));
+      fd.append('text', text || (firstAtt?.name ?? ''));
+      if (firstAtt) fd.append('attachment', firstAtt.file, firstAtt.name);
+
+      const capturedKey = activeChat;
+      const tempId = Date.now() + Math.random();
+      const optMsg: Message = {
+        id: tempId, author: 'You', content: text, time: now, status: 'pending', dateKey: todayDateKey(),
+        attachments: firstAtt ? [{ name: firstAtt.name, size: firstAtt.size, isImage: firstAtt.isImage, url: firstAtt.previewUrl || '', ext: firstAtt.ext }] : undefined,
+      };
+      setChatMessages(prev => ({ ...prev, [capturedKey]: [...(prev[capturedKey] ?? []), optMsg] }));
+
+      try {
+        const resp = await fetch('/api/messages/send-init', { method: 'POST', body: fd });
+        if (resp.ok) {
+          const json = await resp.json();
+          if (json.chat_id) {
+            const newKey = String(json.chat_id);
+            setDynamicChats(prev => prev.map(c =>
+              c.id === capturedKey
+                ? { ...c, id: newKey, chatId: json.chat_id, pendingRecipientId: undefined }
+                : c
+            ));
+            setChatMessages(prev => {
+              const result: Record<string, Message[]> = {};
+              for (const [k, v] of Object.entries(prev)) {
+                if (k === capturedKey) {
+                  result[newKey] = v.map(m => m.id === tempId ? { ...m, id: json.id || m.id, status: 'sent' as const } : m);
+                } else {
+                  result[k] = v;
+                }
+              }
+              return result;
+            });
+            setActiveChat(prev => prev === capturedKey ? newKey : prev);
+          }
+        }
+      } catch {}
+      return;
+    }
+
+    const chatIdNum = parseInt(activeChat);
+    if (isNaN(chatIdNum)) return;
+    const capturedKey = activeChat;
+
+    if (attachments.length > 0) {
+      for (let i = 0; i < attachments.length; i++) {
+        const att = attachments[i];
+        const msgText = i === 0 ? text : '';
+        const tempId = Date.now() + Math.random() + i * 0.001;
+        const fd = new FormData();
+        fd.append('chat_id', String(chatIdNum));
+        fd.append('sender_id', String(myUser.id));
+        fd.append('text', msgText);
+        fd.append('attachment', att.file, att.name);
+
+        const optMsg: Message = {
+          id: tempId, author: 'You', content: msgText, time: now, status: 'pending', dateKey: todayDateKey(),
+          attachments: [{ name: att.name, size: att.size, isImage: att.isImage, url: att.previewUrl || '', ext: att.ext }],
+        };
+        setChatMessages(prev => ({ ...prev, [capturedKey]: [...(prev[capturedKey] ?? []), optMsg] }));
+
+        fetch('/api/messages/send', { method: 'POST', body: fd })
+          .then(async r => {
+            if (r.ok) {
+              const json = await r.json();
+              setChatMessages(prev => {
+                const msgs = prev[capturedKey];
+                if (!msgs) return prev;
+                const cursor = readCursorsRef.current[capturedKey] ?? 0;
+                const status = json.id <= cursor ? 'read' : 'sent';
+                return { ...prev, [capturedKey]: msgs.map(m => m.id === tempId ? { ...m, id: json.id, status } : m) };
+              });
+            }
+          })
+          .catch(() => {});
+      }
+    } else {
+      const tempId = Date.now() + Math.random();
+      const optMsg: Message = { id: tempId, author: 'You', content: text, time: now, status: 'pending', dateKey: todayDateKey() };
+      setChatMessages(prev => ({ ...prev, [capturedKey]: [...(prev[capturedKey] ?? []), optMsg] }));
+
+      if (!navigator.onLine) {
+        pendingQueueRef.current.push({ chatKey: capturedKey, chatIdNum, text, tempId });
+        return;
+      }
+
+      const fd = new FormData();
+      fd.append('chat_id', String(chatIdNum));
+      fd.append('sender_id', String(myUser.id));
+      fd.append('text', text);
+
+      fetch('/api/messages/send', { method: 'POST', body: fd })
+        .then(async r => {
+          if (r.ok) {
+            const json = await r.json();
+            setChatMessages(prev => {
+              const msgs = prev[capturedKey];
+              if (!msgs) return prev;
+              const cursor = readCursorsRef.current[capturedKey] ?? 0;
+              const status = json.id <= cursor ? 'read' : 'sent';
+              return { ...prev, [capturedKey]: msgs.map(m => m.id === tempId ? { ...m, id: json.id, status } : m) };
+            });
+          }
+        })
+        .catch(() => {
+          setConnStatus('reconnecting');
+          pendingQueueRef.current.push({ chatKey: capturedKey, chatIdNum, text, tempId });
+        });
+    }
   }
 
   function renderContent(text: string) {
@@ -305,6 +784,7 @@ Tine-Line — симулятор жизни в открытом мире на р
         isImage,
         previewUrl: isImage ? URL.createObjectURL(file) : '',
         ext,
+        file,
       };
     });
     setPendingAttachments(prev => [...prev, ...previews]);
@@ -355,14 +835,18 @@ Tine-Line — симулятор жизни в открытом мире на р
                   key={u.id}
                   className="flex items-center gap-3 px-3 py-2 hover:bg-[#2a2a3a] cursor-pointer"
                   onClick={() => {
+                    if (!myUser) return;
+                    const avatar = u.avatar_url ?? `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(u.username)}`;
+                    const name = u.display_name || u.username;
+                    const chatId = `pending-${u.id}`;
                     setDynamicChats(prev =>
-                      prev.some(c => c.id === u.username)
+                      prev.some(c => c.id === chatId)
                         ? prev
-                        : [{ id: u.username, name: u.display_name || u.username, avatar: u.avatar_url ?? `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(u.username)}` }, ...prev]
+                        : [{ id: chatId, name, avatar, pendingRecipientId: u.id }, ...prev]
                     );
-                    setActiveChat(u.username);
+                    setActiveChat(chatId);
                     setNewChatOpen(false);
-                    setNewChatValue("");
+                    setNewChatValue('');
                     setSearchResults([]);
                   }}
                 >
@@ -373,7 +857,7 @@ Tine-Line — симулятор жизни в открытом мире на р
                   />
                   <div>
                     <div className="text-white text-sm font-medium">{u.display_name || u.username}</div>
-                    <div className="text-gray-500 text-xs">@{u.username}</div>
+                    <div className="text-gray-500 text-xs">@{u.display_name || u.username}</div>
                   </div>
                 </li>
               ))}
@@ -395,8 +879,9 @@ Tine-Line — симулятор жизни в открытом мире на р
         token={authToken ?? undefined}
         nickname={myNickname}
         bio={myBio}
-        onSaveProfile={({ display_name, bio }) => {
-          const updated = { ...myUser!, display_name, bio };
+        username={myUser?.username}
+        onSaveProfile={({ display_name, bio, username }) => {
+          const updated = { ...myUser!, display_name, bio, username };
           setMyUser(updated);
           localStorage.setItem("authUser", JSON.stringify(updated));
         }}
@@ -404,11 +889,46 @@ Tine-Line — симулятор жизни в открытом мире на р
           localStorage.removeItem("authToken");
           localStorage.removeItem("authUser");
           setAuthed(false);
+          setMyUser(null);
+          setAuthToken(null);
+          setActiveChat('andrey-shmelefnik');
+          setDynamicChats([]);
+          setChatMessages({});
+          setHistoricalMessages({});
+          readCursorsRef.current = {};
+          userNameCache.current.clear();
           setProfileOpen(false);
         }}
       />
       <UserProfileModal open={contactProfileOpen} onClose={() => setContactProfileOpen(false)} username={currentChat?.name ?? ""} />
-      <CreateGroupModal open={newGroupOpen} onClose={() => setNewGroupOpen(false)} />
+      <CreateGroupModal
+        open={newGroupOpen}
+        onClose={() => setNewGroupOpen(false)}
+        myUser={myUser}
+        onGroupCreated={(chat) => {
+          setDynamicChats(prev =>
+            prev.some(c => c.id === chat.id) ? prev : [{
+              id: chat.id, chatId: chat.chatId, name: chat.name,
+              avatar: chat.avatar, chatType: 'group' as const,
+            }, ...prev]
+          );
+          setActiveChat(chat.id);
+        }}
+      />
+      <AddGroupMembersModal
+        open={addMembersOpen}
+        onClose={() => setAddMembersOpen(false)}
+        chatId={parseInt(activeChat)}
+        myUserId={myUser?.id}
+      />
+      <GroupProfileModal
+        open={groupProfileOpen}
+        onClose={() => setGroupProfileOpen(false)}
+        chatId={parseInt(activeChat)}
+        groupName={currentChat?.name ?? ''}
+        myUserId={myUser?.id}
+        onAddMembers={() => setAddMembersOpen(true)}
+      />
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
@@ -436,15 +956,31 @@ Tine-Line — симулятор жизни в открытом мире на р
         <ChatList chats={chats} activeChatId={activeChat} onSelectChat={setActiveChat} />
 
         <div className="flex-1 flex flex-col bg-[#1E1E2A] min-w-0">
-          <div className="bg-[#232332] px-6 py-[7px] border-b border-[#3a3a3a]">
-            <h2
-              className={`text-lg font-semibold mb-0.5 ${currentChat ? "cursor-pointer hover:text-purple-400 transition-colors" : ""}`}
-              onClick={() => currentChat && setContactProfileOpen(true)}
-            >
-              {currentChat?.name || 'Select a chat'}
-            </h2>
-            {currentChat && <span className="text-[13px] text-gray-500">Last seen recently</span>}
+          <div className="bg-[#232332] px-6 py-[7px] border-b border-[#3a3a3a] flex items-center justify-between">
+            <div>
+              <h2
+                className={`text-lg font-semibold mb-0.5 ${currentChat ? "cursor-pointer hover:text-purple-400 transition-colors" : ""}`}
+                onClick={() => {
+                  if (!currentChat) return;
+                  if (isGroupChat) setGroupProfileOpen(true);
+                  else setContactProfileOpen(true);
+                }}
+              >
+                {currentChat?.name || 'Select a chat'}
+              </h2>
+              {currentChat && (
+                isGroupChat
+                  ? <span className="text-[13px] text-gray-500">Group chat</span>
+                  : <span className="text-[13px] text-gray-500">Last seen recently</span>
+              )}
+            </div>
           </div>
+
+          {connStatus !== 'connected' && (
+            <div className={`px-4 py-1 text-xs text-center font-medium ${connStatus === 'offline' ? 'bg-red-900/70 text-red-200' : 'bg-yellow-900/70 text-yellow-200'}`}>
+              {connStatus === 'offline' ? 'No internet connection' : 'Connecting…'}
+            </div>
+          )}
 
           <div className="flex-1 overflow-y-auto flex justify-center">
             <div className="w-full max-w-[720px] px-6 py-6">
@@ -459,23 +995,32 @@ Tine-Line — симулятор жизни в открытом мире на р
                 const roundingOwn = `${isFirst ? "mt-2" : ""} ${isLast ? "mb-2" : ""} rounded-tl-md rounded-bl-md rounded-tr-md rounded-br-md`;
                 const roundingOther = `${isFirst ? "mt-2" : ""} ${isLast ? "mb-2" : ""} rounded-tr-md rounded-br-md rounded-tl-md rounded-bl-md`;
 
+                const showDateMarker =
+                  msg.date ||
+                  (msg.dateKey && (!prev?.dateKey || prev.dateKey !== msg.dateKey));
+                const dateLabel = msg.date || (msg.dateKey ? formatDateMarker(msg.dateKey) : '');
+
                 return (
                   <div key={msg.id}>
-                    {msg.date && (
-                      <div className="text-center text-gray-500 text-xs mb-6 opacity-70">{msg.date}</div>
+                    {showDateMarker && dateLabel && (
+                      <div className="flex items-center gap-3 my-4">
+                        <div className="flex-1 h-px bg-[#3a3a3a]" />
+                        <span className="text-gray-500 text-xs px-2 select-none">{dateLabel}</span>
+                        <div className="flex-1 h-px bg-[#3a3a3a]" />
+                      </div>
                     )}
 
                     <div className={`flex items-end gap-2 ${isOwn ? "justify-end" : "justify-start"}`}>
                       {!isOwn && (
                         isLast
-                          ? <img src={avatarUrl(msg.author)} alt={msg.author} className="w-9 h-9 mb-2 rounded-full object-cover bg-[#3a3a3a] shrink-0" />
-                          : <div className="w-9 shrink-0" />
+                          ? <div className="w-10 h-10 mb-2 rounded-full bg-[#3a3a53] shrink-0 overflow-hidden"><img src={avatarUrl(currentChat?.name ?? msg.author)} alt={msg.author} className="w-full h-full object-cover" /></div>
+                          : <div className="w-10 shrink-0" />
                       )}
 
                       <div className={`max-w-[520px] my-[2px] overflow-hidden
                         ${{ small: 'text-xs', medium: 'text-sm', large: 'text-base' }[fontSize]}
-                        ${isOwn ? `bg-gradient-to-r from-purple-600 to-purple-700 text-white ${roundingOwn}` : `bg-[#2f2f2f] text-gray-200 ${roundingOther}`}
-                        ${hasAttachments ? '' : 'px-4 py-2 whitespace-pre-wrap'}`}>
+                        ${isOwn ? `bg-gradient-to-r from-purple-800 to-purple-900 text-white ${roundingOwn}` : `bg-[#2f2f2f] text-gray-200 ${roundingOther}`}
+                        ${hasAttachments ? '' : 'relative px-4 py-2 whitespace-pre-wrap'}`}>
 
                         {hasAttachments ? (
                           <>
@@ -485,11 +1030,10 @@ Tine-Line — симулятор жизни в открытом мире на р
                                   <img src={att.url} alt={att.name} className="w-full max-h-[260px] object-cover block" />
                                   <div className={`px-3 py-2 ${isOwn ? 'bg-black/20' : 'bg-[#272727]'}`}>
                                     <div className="text-[12px] font-medium text-white/90">{att.name}</div>
-                                    <div className="flex items-center justify-between mt-0.5">
+                                    <div className="flex items-center mt-0.5">
                                       <span className="text-[11px] text-gray-400">{att.size}</span>
-                                      <span className="text-[10px] text-white/40">{msg.time}</span>
                                     </div>
-                                    <span className="text-[11px] text-blue-400 cursor-pointer">OPEN WITH</span>
+                                    <a href={att.url} target="_blank" rel="noopener noreferrer" download={att.name} className="text-[11px] text-blue-400 hover:text-blue-300 cursor-pointer">OPEN WITH</a>
                                   </div>
                                 </div>
                               ) : (
@@ -498,17 +1042,28 @@ Tine-Line — симулятор жизни в открытом мире на р
                                   <div className="flex-1 min-w-0">
                                     <div className="text-[12px] font-medium text-white/90 truncate">{att.name}</div>
                                     <div className="text-[11px] text-gray-400 mt-0.5">{att.size}</div>
-                                    <div className="flex items-center justify-between mt-1">
-                                      <span className="text-[11px] text-blue-400 cursor-pointer">OPEN WITH</span>
-                                      <span className="text-[10px] text-white/40">{msg.time}</span>
+                                    <div className="flex items-center mt-1">
+                                      <a href={att.url} target="_blank" rel="noopener noreferrer" download={att.name} className="text-[11px] text-blue-400 hover:text-blue-300 cursor-pointer">OPEN WITH</a>
                                     </div>
                                   </div>
                                 </div>
                               )
                             )}
                             {msg.content ? (
-                              <div className="px-4 py-2 whitespace-pre-wrap">{renderContent(msg.content)}</div>
-                            ) : null}
+                              <div className="relative px-4 py-2 whitespace-pre-wrap">
+                                {renderContent(msg.content)}
+                                <span className={`inline-block ${isOwn ? 'w-[60px]' : 'w-[46px]'}`} />
+                                <span className="absolute bottom-[4px] right-2 flex items-center gap-0.5 select-none leading-none">
+                                  <span className="text-[10px] text-white/60">{msg.time}</span>
+                                  {isOwn && (msg.status === 'read' ? <span className="text-[10px] text-blue-400">✓✓</span> : msg.status === 'sent' ? <span className="text-[10px] text-white/60">✓</span> : msg.status === 'pending' ? <span className="text-[10px] text-white/40">·</span> : null)}
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="flex justify-end items-center gap-0.5 px-3 pb-1.5">
+                                <span className="text-[10px] text-white/60 select-none">{msg.time}</span>
+                                {isOwn && (msg.status === 'read' ? <span className="text-[10px] text-blue-400 select-none">✓✓</span> : msg.status === 'sent' ? <span className="text-[10px] text-white/60 select-none">✓</span> : msg.status === 'pending' ? <span className="text-[10px] text-white/40 select-none">·</span> : null)}
+                              </div>
+                            )}
                           </>
                         ) : (
                           <>
@@ -516,14 +1071,19 @@ Tine-Line — симулятор жизни в открытом мире на р
                               <div className="text-purple-400 text-sm font-semibold mb-1">{msg.author}</div>
                             )}
                             {renderContent(msg.content)}
+                            <span className={`inline-block ${isOwn ? 'w-[60px]' : 'w-[46px]'}`} />
+                            <span className="absolute bottom-[4px] right-2 flex items-center gap-0.5 select-none leading-none">
+                              <span className="text-[10px] text-white/60">{msg.time}</span>
+                              {isOwn && (msg.status === 'read' ? <span className="text-[10px] text-blue-400">✓✓</span> : msg.status === 'sent' ? <span className="text-[10px] text-white/60">✓</span> : msg.status === 'pending' ? <span className="text-[10px] text-white/40">·</span> : null)}
+                            </span>
                           </>
                         )}
                       </div>
 
                       {isOwn && (
                         isLast
-                          ? <img src={avatarUrl(myNickname)} alt="You" className="w-9 h-9 mb-2 rounded-full object-cover bg-purple-600 shrink-0" />
-                          : <div className="w-9 shrink-0" />
+                          ? <div className="w-10 h-10 mb-2 rounded-full bg-purple-600 shrink-0 overflow-hidden"><img src={avatarUrl(myNickname)} alt="You" className="w-full h-full object-cover" /></div>
+                          : <div className="w-10 shrink-0" />
                       )}
                     </div>
                   </div>

@@ -1,6 +1,11 @@
 "use client";
 import React, { useState } from "react";
 
+
+function groupAvatarUrl(seed: string) {
+  return `https://picsum.photos/seed/${encodeURIComponent(seed)}/400/240`;
+}
+
 export default function ChatList({
   chats,
   activeChatId,
@@ -9,6 +14,7 @@ export default function ChatList({
   chats: Array<{
     id: string;
     name: string;
+    type?: string;
     avatar?: string;
     lastMessage?: string;
     lastSender?: string;
@@ -61,11 +67,20 @@ export default function ChatList({
             onClick={() => onSelectChat(chat.id)}
           >
             {/* Avatar */}
-            <img
-              src={`https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(chat.name)}`}
-              alt={chat.name}
-              className="min-w-[40px] h-10 w-10 rounded-full object-cover bg-[#3a3a53] shrink-0"
-            />
+            {chat.type === "group" && (
+                <img
+                src={groupAvatarUrl(chat.name)}
+                    alt={chat.name}
+                className="min-w-[40px] h-10 w-10 rounded-full object-cover bg-[#3a3a53] shrink-0"
+                />
+            )}
+            {chat.type !== "group" && (
+                <img
+                src={`https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(chat.name)}`}
+                    alt={chat.name}
+                className="min-w-[40px] h-10 w-10 rounded-full object-cover bg-[#3a3a53] shrink-0"
+                />
+            )}
             <div className="flex-1 min-w-0 flex flex-col gap-0.5">
               {/* Top row: name + checks + time */}
               <div className="flex items-center justify-between gap-2">

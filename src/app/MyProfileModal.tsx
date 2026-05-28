@@ -12,6 +12,7 @@ export default function MyProfileModal({
   token,
   nickname: initialNickname,
   bio: initialBio,
+  username: initialUsername,
   onSaveProfile,
 }: {
   open: boolean;
@@ -21,9 +22,11 @@ export default function MyProfileModal({
   token?: string;
   nickname?: string;
   bio?: string;
-  onSaveProfile?: (updates: { display_name: string; bio: string }) => void;
+  username?: string;
+  onSaveProfile?: (updates: { display_name: string; bio: string; username: string }) => void;
 }) {
   const [displayName, setDisplayName] = useState(initialNickname ?? "");
+  const [usernameVal, setUsernameVal] = useState(initialUsername ?? "");
   const [bio, setBio] = useState(initialBio ?? "");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -43,9 +46,11 @@ export default function MyProfileModal({
     setSaving(true);
     try {
       if (userId && token) {
-        await api.updateUser(userId, token, { display_name: displayName, bio });
+        const updated = await api.updateUser(userId, token, { username: usernameVal, display_name: displayName, bio });
+        onSaveProfile?.({ display_name: updated.display_name ?? displayName, bio: updated.bio ?? bio, username: updated.username ?? usernameVal });
+      } else {
+        onSaveProfile?.({ display_name: displayName, bio, username: usernameVal });
       }
-      onSaveProfile?.({ display_name: displayName, bio });
       onClose();
     } catch (err: unknown) {
       setSaveError(err instanceof Error ? err.message : "Failed to save");
@@ -57,6 +62,16 @@ export default function MyProfileModal({
   return (
     <Modal open={open} onClose={onClose} title="My Profile">
       <div className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-300 mb-2">Username</label>
+          <input
+            type="text"
+            value={usernameVal}
+            onChange={(e) => setUsernameVal(e.target.value)}
+            className="w-full bg-[#1e1e2a] border border-[#303048] rounded-lg py-2 px-4 text-white"
+          />
+        </div>
+
         <div>
           <label className="block text-sm font-medium text-gray-300 mb-2">Display Name</label>
           <input
